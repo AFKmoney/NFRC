@@ -2136,6 +2136,154 @@ def decompress_binary_bit(input_path: str, output_path: str, emitter: ProgressEm
 
 
 # =========================================================================
+# DELTA / XOR COMBO MODE — for counters, timestamps, arithmetic data
+# =========================================================================
+
+MAGIC_DLT = b'NFD\x00'  # NFR Delta/XOR + O2
+
+def compress_binary_delta(input_path: str, output_path: str, emitter: ProgressEmitter,
+                          delta_order: int = 1, use_xor: bool = False):
+    """Delta or XOR encoding + O2 AC. Best for arithmetic sequences."""
+    _, _, _, _, _encode_o2, _ = _kernels()
+    _, _finish, _, _, _, _ = _kernels()
+
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    emitter.emit("scan", progress=0.3, current_ratio=1.0)
+
+    if use_xor:
+        transformed = _xor_encode(data, delta_order)
+        transform_id = 1
+    else:
+        transformed = _delta_encode(data, delta_order)
+        transform_id = 0
+    emitter.emit("scan", progress=0.6, current_ratio=1.0)
+
+    cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+    cum_freqs[:] = np.arange(257, dtype=np.uint32)
+
+    emitter.emit("encode", progress=0.0, current_ratio=1.0, throughput_mbs=0.0)
+    state = np.array([0, TOP_VALUE, 0, 0, 0], dtype=np.int64)
+    safe_buf = max(n + 1024, 4096)
+    out_buf = np.zeros(safe_buf, dtype=np.uint8)
+
+    t0 = time.time()
+    n_written = _encode_o2(transformed, cum_freqs, state, out_buf, safe_buf)
+    finish_buf = np.zeros(64, dtype=np.uint8)
+    n_fin = _finish(state, finish_buf, 64)
+    dt = max(time.time() - t0, 1e-6)
+    total_compressed = n_written + n_fin
+    ratio = orig / max(total_compressed, 1)
+    mbs = (n / 1_048_576) / dt
+    emitter.emit("encode", progress=1.0, current_ratio=round(ratio, 3),
+                 throughput_mbs=round(mbs, 2))
+
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_DLT)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+        f.write(struct.pack('>I', crc))
+        f.write(struct.pack('>B', transform_id))
+        f.write(struct.pack('>B', delta_order))
+        f.write(out_buf[:n_written].tobytes())
+        f.write(finish_buf[:n_fin].tobytes())
+
+    out_size = os.path.getsize(output_path)
+    if out_size >= orig:
+        os.remove(output_path)
+        with open(output_path, 'wb') as f:
+            f.write(MAGIC_DLT)
+            f.write(struct.pack('>B', 6))
+            f.write(struct.pack('>Q', orig))
+            f.write(struct.pack('>I', crc))
+            f.write(struct.pack('>B', 0xFF))  # store marker
+            f.write(struct.pack('>B', 0))
+            f.write(data.tobytes())
+        out_size = os.path.getsize(output_path)
+        ratio = orig / out_size
+
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_delta(input_path: str, output_path: str, emitter: ProgressEmitter):
+    _, _, _, _, _, _decode_o2 = _kernels()
+
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_DLT:
+            raise ValueError(f"Bad magic for DLT mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        transform_id = struct.unpack('>B', f.read(1))[0]
+        delta_order = struct.unpack('>B', f.read(1))[0]
+
+        if transform_id == 0xFF:
+            raw = f.read()
+            actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
+            if actual_crc != crc:
+                raise ValueError(f"CRC mismatch (store): {crc:08x} vs {actual_crc:08x}")
+            with open(output_path, 'wb') as fout:
+                fout.write(raw)
+            emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                         time_s=round(time.time() - emitter.t0, 2))
+            return
+        compressed = np.frombuffer(f.read(), dtype=np.uint8)
+
+    cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+    cum_freqs[:] = np.arange(257, dtype=np.uint32)
+
+    value = np.int64(0)
+    buf_ptr = 0
+    bit_ptr = 7
+    for _ in range(32):
+        if buf_ptr < len(compressed):
+            byte = int(compressed[buf_ptr])
+            bit = (byte >> bit_ptr) & 1
+            bit_ptr -= 1
+            if bit_ptr < 0:
+                bit_ptr = 7; buf_ptr += 1
+        else:
+            bit = 0
+        value = (value << np.int64(1)) | np.int64(bit)
+    state = np.array([0, TOP_VALUE, value, buf_ptr, bit_ptr], dtype=np.int64)
+
+    transformed = np.zeros(orig, dtype=np.uint8)
+    if orig > 0:
+        emitter.emit("decode", progress=0.0)
+        _decode_o2(compressed, orig, cum_freqs, state, transformed)
+        emitter.emit("decode", progress=0.5)
+
+    if transform_id == 1:
+        out_data = _xor_decode(transformed, delta_order)
+    else:
+        out_data = _delta_decode(transformed, delta_order)
+    emitter.emit("decode", progress=1.0)
+
+    actual_crc = zlib.crc32(out_data.tobytes()) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out_data.tobytes())
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
+
+
+# =========================================================================
 # BWT (Burrows-Wheeler Transform) — pre-pass for text
 # =========================================================================
 # BWT sorts all rotations of the input, then takes the last column.
@@ -3652,6 +3800,23 @@ def compress(input_path: str, output_path: str, emitter: Optional[ProgressEmitte
             except Exception as e:
                 ProgressEmitter.log(f"BIT candidate failed: {e}")
 
+        # Try Delta encoding (for files <= 5MB — best for counters/timestamps)
+        if size <= 5_000_000:
+            for order in [1, 2, 4]:
+                tmp_dlt = output_path + f'.dlt{order}.tmp'
+                try:
+                    compress_binary_delta(input_path, tmp_dlt, emitter, delta_order=order, use_xor=False)
+                    candidates.append((f'dlt{order}', tmp_dlt, os.path.getsize(tmp_dlt)))
+                except Exception as e:
+                    ProgressEmitter.log(f"DLT{order} candidate failed: {e}")
+            # Also try XOR-1
+            tmp_xor = output_path + '.xor1.tmp'
+            try:
+                compress_binary_delta(input_path, tmp_xor, emitter, delta_order=1, use_xor=True)
+                candidates.append(('xor1', tmp_xor, os.path.getsize(tmp_xor)))
+            except Exception as e:
+                ProgressEmitter.log(f"XOR1 candidate failed: {e}")
+
         if not candidates:
             raise RuntimeError("All compression strategies failed")
 
@@ -3694,6 +3859,8 @@ def decompress(input_path: str, output_path: str, emitter: Optional[ProgressEmit
         return decompress_binary_trs(input_path, output_path, emitter)
     elif magic == MAGIC_BIT:
         return decompress_binary_bit(input_path, output_path, emitter)
+    elif magic == MAGIC_DLT:
+        return decompress_binary_delta(input_path, output_path, emitter)
     elif magic == MAGIC_V5:
         raise NotImplementedError("Legacy v5 (.nfr) decode not supported by v6 engine. Use NFR_Release/nfr.py.")
     else:
