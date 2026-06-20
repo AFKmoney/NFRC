@@ -1,0 +1,4 @@
+torch
+numba
+numpy
+opencv-python-headless
