@@ -1,8 +1,32 @@
 # NFRC — Neural Fractal Reconstruction Codec
 
-**NFRC** is a proprietary multi-strategy universal compressor that combines four distinct coding strategies and automatically selects the best one for each file. It achieves high compression ratios on text, code, structured data, sparse binaries, and media through a unified pipeline.
+**NFRC** is a proprietary multi-strategy universal compressor with a full-stack web application for real-time compression visualization. It combines four distinct coding strategies and automatically selects the best one for each file.
 
-> **Status:** v6.3 — production engine, all roundtrips bit-perfect verified.
+> **Status:** v6.3 — production engine + web app, all roundtrips bit-perfect verified.
+
+---
+
+## What's in this repo
+
+```
+NFRC/
+├── nfr_v6_engine.py     # The compression engine (Python)
+├── requirements.txt     # Python deps
+├── src/                 # Next.js web app (TypeScript)
+│   ├── app/
+│   │   ├── page.tsx     # Drag & drop UI with live compression animation
+│   │   ├── api/         # REST + SSE endpoints
+│   │   └── layout.tsx
+│   ├── components/ui/   # shadcn/ui components
+│   └── hooks/
+├── prisma/              # Database schema
+├── package.json         # Node deps
+└── README.md
+```
+
+Two components:
+1. **Engine** (`nfr_v6_engine.py`) — standalone Python compressor
+2. **Web App** (`src/`) — Next.js UI with drag & drop, real-time ratio animation, file manager
 
 ---
 
@@ -27,7 +51,7 @@ NFRC picks the winner automatically — you never have to choose.
 ## Algorithms
 
 ### 1. Order-2 Adaptive Context Arithmetic Coding (O2)
-The workhorse binary mode. Maintains 65,536 frequency tables (one per 2-byte context) that update adaptively as data is encoded. Encoder and decoder stay in sync without storing tables. Uses a 32-bit arithmetic coder with Numba JIT acceleration.
+The workhorse binary mode. Maintains 65,536 frequency tables (one per 2-byte context) that update adaptively as data is encoded. Encoder and decoder stay in sync without storing tables. 32-bit arithmetic coder with Numba JIT acceleration.
 
 ### 2. RLE Pre-Pass
 Runs of 4+ identical bytes are collapsed to 5 bytes (4 copies + count byte, supporting runs up to 259). On sparse data with long zero runs, this alone gives 50–100× compression before the AC even runs.
@@ -69,59 +93,67 @@ The decompressor auto-detects the format from the magic bytes.
 
 ---
 
-## Installation
+## Quick Start
 
+### Option A: Use the Web App (recommended)
+
+**1. Install Python deps (for the engine):**
 ```bash
-pip install torch numba numpy opencv-python-headless
+pip install -r requirements.txt
 ```
 
-> For GPU acceleration (media mode only), install the CUDA-enabled PyTorch build from [pytorch.org](https://pytorch.org).
-
----
-
-## Usage
-
-### Compress
+**2. Install Node deps (for the app):**
 ```bash
+bun install   # or: npm install
+```
+
+**3. Set up the database:**
+```bash
+cp .env.example .env
+bun run db:push
+```
+
+**4. Configure Python path (optional):**
+```bash
+# If `python` doesn't have the deps, point to your venv
+echo 'NFR_PYTHON=/path/to/your/python' >> .env
+```
+
+**5. Run the app:**
+```bash
+bun run dev
+```
+
+Open http://localhost:3000, drag a file onto the dropzone, see the instant ratio prediction, click **Compress with NFR v6**, and watch the live animation (train → scan → encode phases, real-time ratio counter, throughput, event stream). Your compression history is saved in the sidebar.
+
+### Option B: Use the Engine Directly (CLI)
+
+```bash
+pip install -r requirements.txt
+
+# Compress
 python nfr_v6_engine.py compress input.txt output.nfr
-```
 
-### Decompress
-```bash
+# Decompress
 python nfr_v6_engine.py decompress output.nfr restored.txt
-```
 
-### Predict ratio (instant, no compression)
-```bash
+# Predict ratio (instant, no compression)
 python nfr_v6_engine.py predict input.txt
-# → {"type": "binary", "original_size": 12345, "predicted_ratio": 5.0, ...}
-```
 
-### Benchmark (compress + decompress + verify)
-```bash
+# Benchmark (compress + decompress + verify)
 python nfr_v6_engine.py bench input.txt output.nfr
-```
 
-### Force a specific mode
-```bash
-python nfr_v6_engine.py compress input.txt output.nfr --mode-bin    # force binary
-python nfr_v6_engine.py compress input.mp4 output.nf6 --mode-media  # force media
-```
+# Force a specific mode
+python nfr_v6_engine.py compress input.txt output.nfr --mode-bin    # binary
+python nfr_v6_engine.py compress input.mp4 output.nf6 --mode-media  # media
 
-### JSON progress events (for UI integration)
-```bash
+# JSON progress events (for UI integration)
 python nfr_v6_engine.py compress input.txt output.nfr --json
-# → {"phase":"start",...}
-#   {"phase":"scan","progress":0.5,...}
-#   {"phase":"encode","progress":1.0,"current_ratio":4.32,...}
-#   {"phase":"done","ratio":4.32,"time_s":1.2}
 ```
-
-Set `NFR_JSON=1` env var to enable JSON mode without the `--json` flag.
 
 ---
 
-## Programmatic API
+## Programmatic API (Engine)
 
 ```python
 from nfr_v6_engine import compress, decompress, predict_ratio, ProgressEmitter
@@ -151,6 +183,42 @@ decompress("output.nfr", "restored.txt")
 | `reconstruct`| `progress`                                                  |
 | `done`       | `input_size`, `output_size`, `ratio`, `time_s`              |
 | `error`      | `message`                                                   |
+
+---
+
+## Web App Architecture
+
+### API Routes
+
+| Route                              | Method   | Purpose                                              |
+|------------------------------------|----------|------------------------------------------------------|
+| `/api/predict`                     | `POST`   | Upload file, run instant ratio prediction            |
+| `/api/compress?id=X`               | `POST`   | Start compression subprocess in background           |
+| `/api/status/[id]`                 | `GET`    | SSE stream of compression progress events            |
+| `/api/files`                       | `GET`    | List compression history                             |
+| `/api/files?id=X`                  | `DELETE` | Remove a file from history                           |
+| `/api/decompress`                  | `POST`   | Start decompression subprocess                       |
+| `/api/download/[id]?kind=K`        | `GET`    | Download `compressed` / `decompressed` / `original`  |
+
+### How it works
+
+1. **Predict**: When you drop a file, the app calls `/api/predict`, which spawns the engine's `predict` subcommand to read the first 64 KB and compute a heuristic ratio based on entropy + file type. Returns in <1s.
+
+2. **Compress**: Clicking "Compress" calls `/api/compress`, which spawns the engine as a subprocess with `NFR_JSON=1`. The engine writes JSON progress events to stdout, which the API pipes to a log file.
+
+3. **Stream**: The browser opens an SSE connection to `/api/status/[id]`, which polls the log file every 200ms and forwards new events to the client. The UI animates the ratio counter, progress bar, and event log in real time.
+
+4. **Database**: Prisma + SQLite stores file metadata (name, sizes, ratio, status, paths).
+
+### UI Features
+
+- **Drag & drop** with animated overlay
+- **Instant ratio prediction** card (entropy, dimensions, frames, confidence)
+- **Live compression animation**: progress bar with shimmer, real-time ratio counter, throughput (MB/s), phase indicator (train/scan/encode), event stream log
+- **File manager**: expandable rows showing original/compressed sizes, predicted vs final ratio, download buttons (`.nfr` / decompressed / original), decompress button, remove
+- **Dark glassmorphism** UI with animated gradient blobs + grid overlay
+- **Framer Motion** animations throughout (entrance, hover, drag overlay)
+- **Sonner toasts** for feedback
 
 ---
 
@@ -202,6 +270,7 @@ All ratios below are verified bit-perfect (CRC32 + length match):
 - NRP limited to 500 KB (training time)
 - Media mode is lossless but model-overhead-heavy on small images
 - No streaming decompression for media mode yet (loads full bitstream)
+- Web app currently runs compression in subprocess (not worker queue) — suitable for single-user, not production load
 
 ---
 

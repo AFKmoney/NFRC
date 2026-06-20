@@ -1,0 +1,32 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model NFRFile {
+  id              String   @id @default(cuid())
+  originalName    String
+  originalSize    Int
+  compressedSize  Int      @default(0)
+  ratio           Float    @default(1.0)
+  mode            String   @default("auto") // auto | video | image | binary
+  detectedType    String   @default("unknown") // video | image | binary
+  status          String   @default("pending") // pending | compressing | done | error
+  predictedRatio  Float    @default(1.0)
+  errorMessage    String?
+  inputPath       String
+  outputPath      String?
+  decompressedPath String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([createdAt])
+  @@index([status])
+}
