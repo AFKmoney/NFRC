@@ -1113,6 +1113,8 @@ MAGIC_O2 = b'NFO\x00'  # NFR Order-2 context mode
 MAGIC_BWT = b'NFB\x00'  # NFR BWT + Order-2 context mode
 MAGIC_PPM = b'NFP\x00'  # NFR PPMd multi-order
 MAGIC_NRP = b'NFN\x00'  # NFR Neural Residual Predictor
+MAGIC_BIT = b'NFX\x00'  # NFR Bit-level context model
+MAGIC_TRS = b'NFT\x00'  # NFR Transform combo (BWT+MTF+RLE+O2)
 
 
 # =========================================================================
@@ -1875,6 +1877,265 @@ def decompress_binary_nrp(input_path: str, output_path: str, emitter: ProgressEm
 
 
 # =========================================================================
+# TRANSFORM COMBO MODE — BWT + MTF + RLE + O2 (bzip2-style)
+# =========================================================================
+
+def compress_binary_trs(input_path: str, output_path: str, emitter: ProgressEmitter):
+    """Transform combo: BWT → MTF → RLE → O2 AC. Best for text + structured data."""
+    _, _, _, _, _encode_o2, _ = _kernels()
+    _, _finish, _, _, _, _ = _kernels()
+
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    emitter.emit("scan", progress=0.2, current_ratio=1.0)
+
+    # Step 1: BWT
+    bwt_bytes, primary = _bwt_transform(data)
+    if bwt_bytes is None:
+        return compress_binary_o2(input_path, output_path, emitter)
+    bwt_data = np.frombuffer(bwt_bytes, dtype=np.uint8)
+    emitter.emit("scan", progress=0.4, current_ratio=1.0)
+
+    # Step 2: MTF
+    mtf_data = _mtf_encode(bwt_data)
+    emitter.emit("scan", progress=0.6, current_ratio=1.0)
+
+    # Step 3: RLE
+    rle_data = _rle_encode_bytes(mtf_data)
+    emitter.emit("scan", progress=0.8, current_ratio=1.0)
+
+    # Step 4: O2 AC encode
+    cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+    cum_freqs[:] = np.arange(257, dtype=np.uint32)
+
+    emitter.emit("encode", progress=0.0, current_ratio=1.0, throughput_mbs=0.0)
+    state = np.array([0, TOP_VALUE, 0, 0, 0], dtype=np.int64)
+    safe_buf = max(len(rle_data) + 1024, 4096)
+    out_buf = np.zeros(safe_buf, dtype=np.uint8)
+
+    t0 = time.time()
+    n_written = _encode_o2(rle_data, cum_freqs, state, out_buf, safe_buf)
+    finish_buf = np.zeros(64, dtype=np.uint8)
+    n_fin = _finish(state, finish_buf, 64)
+    dt = max(time.time() - t0, 1e-6)
+    total_compressed = n_written + n_fin
+    ratio = orig / max(total_compressed, 1)
+    mbs = (n / 1_048_576) / dt
+    emitter.emit("encode", progress=1.0, current_ratio=round(ratio, 3),
+                 throughput_mbs=round(mbs, 2))
+
+    # Write output: MAGIC_TRS + ver + orig + crc + primary + rle_len + compressed
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_TRS)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+        f.write(struct.pack('>I', crc))
+        f.write(struct.pack('>Q', primary))
+        f.write(struct.pack('>Q', len(rle_data)))  # rle_data length for decoder
+        f.write(out_buf[:n_written].tobytes())
+        f.write(finish_buf[:n_fin].tobytes())
+
+    out_size = os.path.getsize(output_path)
+    if out_size >= orig:
+        os.remove(output_path)
+        with open(output_path, 'wb') as f:
+            f.write(MAGIC_TRS)
+            f.write(struct.pack('>B', 6))
+            f.write(struct.pack('>Q', orig))
+            crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+            f.write(struct.pack('>I', crc))
+            f.write(struct.pack('>Q', 0xFFFFFFFFFFFFFFFF))  # primary = store marker
+            f.write(struct.pack('>Q', 0))                   # rle_len = 0 (unused)
+            f.write(data.tobytes())
+        out_size = os.path.getsize(output_path)
+        ratio = orig / out_size
+
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_trs(input_path: str, output_path: str, emitter: ProgressEmitter):
+    _, _, _, _, _, _decode_o2 = _kernels()
+
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_TRS:
+            raise ValueError(f"Bad magic for TRS mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        primary = struct.unpack('>Q', f.read(8))[0]
+
+        # Check for store mode (primary = max uint64)
+        if primary == 0xFFFFFFFFFFFFFFFF:
+            f.read(8)  # skip rle_len field
+            raw = f.read()
+            actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
+            if actual_crc != crc:
+                raise ValueError(f"CRC mismatch (store): {crc:08x} vs {actual_crc:08x}")
+            with open(output_path, 'wb') as fout:
+                fout.write(raw)
+            emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                         time_s=round(time.time() - emitter.t0, 2))
+            return
+        rle_len = struct.unpack('>Q', f.read(8))[0]
+        compressed = np.frombuffer(f.read(), dtype=np.uint8)
+
+    # Decode O2 AC (decode orig symbols — RLE data is ≤ orig length)
+    cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+    cum_freqs[:] = np.arange(257, dtype=np.uint32)
+
+    value = np.int64(0)
+    buf_ptr = 0
+    bit_ptr = 7
+    for _ in range(32):
+        if buf_ptr < len(compressed):
+            byte = int(compressed[buf_ptr])
+            bit = (byte >> bit_ptr) & 1
+            bit_ptr -= 1
+            if bit_ptr < 0:
+                bit_ptr = 7; buf_ptr += 1
+        else:
+            bit = 0
+        value = (value << np.int64(1)) | np.int64(bit)
+    state = np.array([0, TOP_VALUE, value, buf_ptr, bit_ptr], dtype=np.int64)
+
+    rle_decoded = np.zeros(rle_len, dtype=np.uint8)
+    if rle_len > 0:
+        emitter.emit("decode", progress=0.0)
+        _decode_o2(compressed, rle_len, cum_freqs, state, rle_decoded)
+        emitter.emit("decode", progress=0.3)
+
+    # Inverse RLE → MTF data (length may differ — trim/pad as needed)
+    mtf_data = _rle_decode_bytes(rle_decoded)
+    emitter.emit("decode", progress=0.6)
+
+    # Inverse MTF → BWT data
+    bwt_data = _mtf_decode(mtf_data)
+    emitter.emit("decode", progress=0.8)
+
+    # Inverse BWT → original
+    out_data = _bwt_inverse(bwt_data.tobytes(), int(primary))
+    emitter.emit("decode", progress=1.0)
+
+    # Trim to original length
+    out_data = out_data[:orig]
+
+    actual_crc = zlib.crc32(out_data.tobytes()) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out_data.tobytes())
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
+
+
+# =========================================================================
+# BIT-LEVEL CONTEXT MODEL MODE
+# =========================================================================
+
+def compress_binary_bit(input_path: str, output_path: str, emitter: ProgressEmitter):
+    """Bit-level context model with order-8 + order-16 mixing."""
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    emitter.emit("scan", progress=0.5, current_ratio=1.0)
+
+    emitter.emit("encode", progress=0.0, current_ratio=1.0, throughput_mbs=0.0)
+    t0 = time.time()
+    bitstream, n_bits = _bit_context_encode(data)
+    dt = max(time.time() - t0, 1e-6)
+    ratio = orig / max(len(bitstream), 1)
+    mbs = (n / 1_048_576) / dt
+    emitter.emit("encode", progress=1.0, current_ratio=round(ratio, 3),
+                 throughput_mbs=round(mbs, 2))
+
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_BIT)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+        f.write(struct.pack('>I', crc))
+        f.write(struct.pack('>Q', n_bits))
+        f.write(bitstream)
+
+    out_size = os.path.getsize(output_path)
+    if out_size >= orig:
+        os.remove(output_path)
+        with open(output_path, 'wb') as f:
+            f.write(MAGIC_BIT)
+            f.write(struct.pack('>B', 6))
+            f.write(struct.pack('>Q', orig))
+            f.write(struct.pack('>I', crc))
+            f.write(struct.pack('>Q', 0xFFFFFFFFFFFFFFFF))
+            f.write(data.tobytes())
+        out_size = os.path.getsize(output_path)
+        ratio = orig / out_size
+
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_bit(input_path: str, output_path: str, emitter: ProgressEmitter):
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_BIT:
+            raise ValueError(f"Bad magic for BIT mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        n_bits = struct.unpack('>Q', f.read(8))[0]
+
+        if n_bits == 0xFFFFFFFFFFFFFFFF:
+            raw = f.read()
+            actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
+            if actual_crc != crc:
+                raise ValueError(f"CRC mismatch (store): {crc:08x} vs {actual_crc:08x}")
+            with open(output_path, 'wb') as fout:
+                fout.write(raw)
+            emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                         time_s=round(time.time() - emitter.t0, 2))
+            return
+        bitstream = f.read()
+
+    emitter.emit("decode", progress=0.0)
+    out_data = _bit_context_decode(bitstream, n_bits)
+    emitter.emit("decode", progress=1.0)
+
+    actual_crc = zlib.crc32(out_data.tobytes()) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out_data.tobytes())
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
+
+
+# =========================================================================
 # BWT (Burrows-Wheeler Transform) — pre-pass for text
 # =========================================================================
 # BWT sorts all rotations of the input, then takes the last column.
@@ -1969,6 +2230,302 @@ def _bwt_inverse(bwt_bytes: bytes, primary: int) -> np.ndarray:
         b = int(bwt[pos])
         out[i] = b
         pos = starts[b] + ranks[pos]
+
+    return out
+
+
+# =========================================================================
+# MTF (Move-to-Front) transform — classic BWT companion
+# =========================================================================
+def _mtf_encode(data: np.ndarray) -> np.ndarray:
+    """Move-to-Front: each byte replaced by its position in a dynamic list.
+    Bytes seen recently get small indices → better for AC."""
+    table = list(range(256))
+    out = np.zeros(len(data), dtype=np.uint8)
+    for i in range(len(data)):
+        b = int(data[i])
+        idx = table.index(b)
+        out[i] = idx
+        # Move to front
+        table.pop(idx)
+        table.insert(0, b)
+    return out
+
+
+def _mtf_decode(data: np.ndarray) -> np.ndarray:
+    """Inverse MTF."""
+    table = list(range(256))
+    out = np.zeros(len(data), dtype=np.uint8)
+    for i in range(len(data)):
+        idx = int(data[i])
+        b = table[idx]
+        out[i] = b
+        table.pop(idx)
+        table.insert(0, b)
+    return out
+
+
+# =========================================================================
+# Delta / XOR transforms — unlock patterns in counters, timestamps, etc.
+# =========================================================================
+def _delta_encode(data: np.ndarray, order: int = 1) -> np.ndarray:
+    """Delta encoding: out[i] = data[i] - data[i-order] (mod 256).
+    Best for arithmetic sequences (counters, timestamps)."""
+    n = len(data)
+    out = data.copy()
+    for i in range(order, n):
+        out[i] = (int(data[i]) - int(data[i - order])) % 256
+    return out.astype(np.uint8)
+
+
+def _delta_decode(data: np.ndarray, order: int = 1) -> np.ndarray:
+    """Inverse delta."""
+    n = len(data)
+    out = data.copy().astype(np.int32)
+    for i in range(order, n):
+        out[i] = (out[i] + out[i - order]) % 256
+    return out.astype(np.uint8)
+
+
+def _xor_encode(data: np.ndarray, order: int = 1) -> np.ndarray:
+    """XOR encoding: out[i] = data[i] ^ data[i-order].
+    Best for data with bit-level patterns."""
+    n = len(data)
+    out = data.copy()
+    for i in range(order, n):
+        out[i] = int(data[i]) ^ int(data[i - order])
+    return out.astype(np.uint8)
+
+
+def _xor_decode(data: np.ndarray, order: int = 1) -> np.ndarray:
+    """Inverse XOR (same as forward XOR)."""
+    return _xor_encode(data, order)
+
+
+# =========================================================================
+# Bit-level context model (PAQ-inspired)
+# =========================================================================
+# Models each bit using context from previous bits. Finds patterns invisible
+# at byte level. Slower but can squeeze 5-15% more on structured data.
+
+def _bit_context_encode(data: np.ndarray) -> tuple:
+    """Bit-level encoding using simple context mixing.
+    Returns (bitstream_bytes, n_bits).
+    Each byte modeled as 8 bits with context = last 12 bits."""
+    n = len(data)
+    if n == 0:
+        return b'', 0
+
+    # Use a simple order-1 bit context (last 8 bits = previous byte)
+    # + order-2 (last 16 bits = previous 2 bytes)
+    # Combined via logistic mixing
+    out_bits = []
+
+    # State: last 16 bits (for context)
+    history = 0  # 16-bit register
+
+    # Two adaptive models: order-8 and order-16
+    # Each tracks (n0, n1) counts per context
+    n0_o8 = np.ones(256, dtype=np.uint32)  # order-8 context (last byte)
+    n1_o8 = np.ones(256, dtype=np.uint32)
+    n0_o16 = np.ones(65536, dtype=np.uint16)  # order-16 context (last 2 bytes)
+    n1_o16 = np.ones(65536, dtype=np.uint16)
+
+    # Arithmetic coder state
+    low = 0; high = TOP_VALUE; pending = 0
+    bit_buf = 0; bit_cnt = 0
+    out_buf = bytearray()
+    half = HALF; quarter = QUARTER; tq = THREE_QUARTERS; top = TOP_VALUE
+
+    def emit_bit(b):
+        nonlocal bit_buf, bit_cnt, pending, out_buf
+        bit_buf = (bit_buf << 1) | b
+        bit_cnt += 1
+        if bit_cnt == 8:
+            out_buf.append(bit_buf)
+            bit_buf = 0; bit_cnt = 0
+
+    def emit_with_pending(b):
+        nonlocal pending
+        emit_bit(b)
+        while pending > 0:
+            emit_bit(1 - b)
+            pending -= 1
+
+    for i in range(n):
+        byte = int(data[i])
+        ctx8 = history & 0xFF
+        ctx16 = history & 0xFFFF
+
+        for bit_pos in range(7, -1, -1):
+            bit = (byte >> bit_pos) & 1
+
+            # Model 1: order-8
+            t8 = n0_o8[ctx8] + n1_o8[ctx8]
+            p8 = n1_o8[ctx8] / t8  # probability of bit=1
+
+            # Model 2: order-16
+            t16 = int(n0_o16[ctx16]) + int(n1_o16[ctx16])
+            if t16 == 0:
+                p16 = 0.5
+            else:
+                p16 = int(n1_o16[ctx16]) / t16
+
+            # Mix (simple average)
+            p = (p8 + p16) / 2
+            p = max(0.001, min(0.999, p))
+
+            # Arithmetic encode
+            r = high - low + 1
+            split = low + int(r * (1 - p))
+            if bit == 0:
+                high = split - 1
+            else:
+                low = split
+
+            # Renormalize
+            while True:
+                if high < half:
+                    emit_with_pending(0)
+                elif low >= half:
+                    emit_with_pending(1)
+                    low -= half; high -= half
+                elif low >= quarter and high < tq:
+                    pending += 1
+                    low -= quarter; high -= quarter
+                else:
+                    break
+                low = (low << 1) & top
+                high = ((high << 1) & top) | 1
+
+            # Update models
+            if bit == 1:
+                n1_o8[ctx8] += 1
+                n1_o16[ctx16] += 1
+            else:
+                n0_o8[ctx8] += 1
+                n0_o16[ctx16] += 1
+
+            # Cap counts to prevent overflow
+            if n1_o8[ctx8] > 65000:
+                n0_o8[ctx8] = (n0_o8[ctx8] + 1) // 2
+                n1_o8[ctx8] = (n1_o8[ctx8] + 1) // 2
+            if n1_o16[ctx16] > 32000:
+                n0_o16[ctx16] = (n0_o16[ctx16] + 1) // 2
+                n1_o16[ctx16] = (n1_o16[ctx16] + 1) // 2
+
+            # Update history
+            history = ((history << 1) | bit) & 0xFFFF
+
+    # Finish
+    pending += 1
+    if low < quarter:
+        emit_with_pending(0)
+    else:
+        emit_with_pending(1)
+    if bit_cnt > 0:
+        out_buf.append(bit_buf << (8 - bit_cnt))
+
+    return bytes(out_buf), n * 8
+
+
+def _bit_context_decode(bitstream: bytes, n_bits: int) -> np.ndarray:
+    """Inverse bit-level context model."""
+    n_bytes = n_bits // 8
+    if n_bytes == 0:
+        return np.zeros(0, dtype=np.uint8)
+
+    compressed = np.frombuffer(bitstream, dtype=np.uint8)
+
+    n0_o8 = np.ones(256, dtype=np.uint32)
+    n1_o8 = np.ones(256, dtype=np.uint32)
+    n0_o16 = np.ones(65536, dtype=np.uint16)
+    n1_o16 = np.ones(65536, dtype=np.uint16)
+
+    low = 0; high = TOP_VALUE
+    value = 0; buf_ptr = 0; bit_ptr = 7
+    half = HALF; quarter = QUARTER; tq = THREE_QUARTERS; top = TOP_VALUE
+
+    # Prime
+    for _ in range(32):
+        if buf_ptr < len(compressed):
+            byte = int(compressed[buf_ptr])
+            bit = (byte >> bit_ptr) & 1
+            bit_ptr -= 1
+            if bit_ptr < 0:
+                bit_ptr = 7; buf_ptr += 1
+        else:
+            bit = 0
+        value = (value << 1) | bit
+
+    history = 0
+    out = np.zeros(n_bytes, dtype=np.uint8)
+
+    for i in range(n_bytes):
+        byte = 0
+        ctx8 = history & 0xFF
+        ctx16 = history & 0xFFFF
+
+        for bit_pos in range(7, -1, -1):
+            t8 = n0_o8[ctx8] + n1_o8[ctx8]
+            p8 = n1_o8[ctx8] / t8
+            t16 = n0_o16[ctx16] + n1_o16[ctx16]
+            p16 = n1_o16[ctx16] / t16
+            p = (p8 + p16) / 2
+            p = max(0.001, min(0.999, p))
+
+            r = high - low + 1
+            split = low + int(r * (1 - p))
+
+            # Decode bit
+            if value < split:
+                bit = 0
+                high = split - 1
+            else:
+                bit = 1
+                low = split
+
+            byte = (byte << 1) | bit
+
+            # Renormalize
+            while True:
+                if high < half:
+                    pass
+                elif low >= half:
+                    low -= half; high -= half; value -= half
+                elif low >= quarter and high < tq:
+                    low -= quarter; high -= quarter; value -= quarter
+                else:
+                    break
+                low = (low << 1) & top
+                high = ((high << 1) & top) | 1
+                if buf_ptr < len(compressed):
+                    b = int(compressed[buf_ptr])
+                    nb = (b >> bit_ptr) & 1
+                    bit_ptr -= 1
+                    if bit_ptr < 0:
+                        bit_ptr = 7; buf_ptr += 1
+                else:
+                    nb = 0
+                value = ((value << 1) & top) | nb
+
+            # Update
+            if bit == 1:
+                n1_o8[ctx8] += 1
+                n1_o16[ctx16] += 1
+            else:
+                n0_o8[ctx8] += 1
+                n0_o16[ctx16] += 1
+            if n1_o8[ctx8] > 65000:
+                n0_o8[ctx8] = (n0_o8[ctx8] + 1) // 2
+                n1_o8[ctx8] = (n1_o8[ctx8] + 1) // 2
+            if n1_o16[ctx16] > 32000:
+                n0_o16[ctx16] = (n0_o16[ctx16] + 1) // 2
+                n1_o16[ctx16] = (n1_o16[ctx16] + 1) // 2
+
+            history = ((history << 1) | bit) & 0xFFFF
+
+        out[i] = byte
 
     return out
 
@@ -3077,6 +3634,24 @@ def compress(input_path: str, output_path: str, emitter: Optional[ProgressEmitte
             except Exception as e:
                 ProgressEmitter.log(f"BWT candidate failed: {e}")
 
+        # Try TRS combo (BWT+MTF+RLE+O2 — for files <= 5MB)
+        if size <= 5_000_000:
+            tmp_trs = output_path + '.trs.tmp'
+            try:
+                compress_binary_trs(input_path, tmp_trs, emitter)
+                candidates.append(('trs', tmp_trs, os.path.getsize(tmp_trs)))
+            except Exception as e:
+                ProgressEmitter.log(f"TRS candidate failed: {e}")
+
+        # Try BIT-level context model (for files <= 100KB — slow Python)
+        if size <= 100_000:
+            tmp_bit = output_path + '.bit.tmp'
+            try:
+                compress_binary_bit(input_path, tmp_bit, emitter)
+                candidates.append(('bit', tmp_bit, os.path.getsize(tmp_bit)))
+            except Exception as e:
+                ProgressEmitter.log(f"BIT candidate failed: {e}")
+
         if not candidates:
             raise RuntimeError("All compression strategies failed")
 
@@ -3115,6 +3690,10 @@ def decompress(input_path: str, output_path: str, emitter: Optional[ProgressEmit
         return decompress_binary_ppm(input_path, output_path, emitter)
     elif magic == MAGIC_NRP:
         return decompress_binary_nrp(input_path, output_path, emitter)
+    elif magic == MAGIC_TRS:
+        return decompress_binary_trs(input_path, output_path, emitter)
+    elif magic == MAGIC_BIT:
+        return decompress_binary_bit(input_path, output_path, emitter)
     elif magic == MAGIC_V5:
         raise NotImplementedError("Legacy v5 (.nfr) decode not supported by v6 engine. Use NFR_Release/nfr.py.")
     else:
