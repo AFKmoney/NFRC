@@ -2140,6 +2140,490 @@ def decompress_binary_bit(input_path: str, output_path: str, emitter: ProgressEm
 # =========================================================================
 
 MAGIC_DLT = b'NFD\x00'  # NFR Delta/XOR + O2
+MAGIC_PRG = b'NFR\x00'  # NFR PRNG-detected (seed + params)
+MAGIC_BPL = b'NFL\x00' # NFR Bit-plane decomposition (was NFPL, fixed to 4 bytes)
+
+
+# =========================================================================
+# PRNG DETECTOR — detect LCG, XORShift, Mersenne Twister
+# =========================================================================
+# Most "random" data is actually pseudo-random. If we can detect the generator
+# and its parameters, we can reproduce the entire stream from just a seed.
+# This gives 10000x+ ratios on PRNG output.
+
+def _try_detect_lcg32(data: np.ndarray) -> dict:
+    """Try to detect a 32-bit LCG: x[n+1] = (a*x[n] + c) mod 2^32.
+    Returns dict with seed, a, c if found, else None."""
+    n = len(data)
+    if n < 16 or n % 4 != 0:
+        return None
+    # Interpret as 32-bit little-endian words
+    words = np.frombuffer(data.tobytes()[:n - (n % 4)], dtype=np.uint32)
+    if len(words) < 4:
+        return None
+
+    M = 1 << 32
+    # Solve: w1 = a*w0 + c mod M
+    #        w2 = a*w1 + c mod M
+    # → a = (w2 - w1) * inverse(w1 - w0) mod M  (if w1 != w0)
+    d01 = int(words[1]) - int(words[0])
+    d12 = int(words[2]) - int(words[1])
+
+    if d01 == 0:
+        return None
+
+    # Compute modular inverse of d01 mod 2^32 (only exists if d01 is odd)
+    if d01 % 2 == 0:
+        return None
+
+    def modinv(a, m):
+        # Extended Euclidean
+        g, x, _ = _extended_gcd(a % m, m)
+        if g != 1:
+            return None
+        return x % m
+
+    inv = modinv(d01, M)
+    if inv is None:
+        return None
+
+    a = (d12 * inv) % M
+    c = (int(words[1]) - a * int(words[0])) % M
+
+    # Verify against all words
+    x = int(words[0])
+    for i in range(1, len(words)):
+        x = (a * x + c) % M
+        if x != int(words[i]):
+            return None
+
+    return {'type': 'lcg32', 'seed': int(words[0]), 'a': a, 'c': c, 'n_words': len(words)}
+
+
+def _extended_gcd(a, b):
+    if a == 0:
+        return b, 0, 1
+    g, x, y = _extended_gcd(b % a, a)
+    return g, y - (b // a) * x, x
+
+
+def _try_detect_lcg64(data: np.ndarray) -> dict:
+    """Try to detect a 64-bit LCG."""
+    n = len(data)
+    if n < 32 or n % 8 != 0:
+        return None
+    words = np.frombuffer(data.tobytes()[:n - (n % 8)], dtype=np.uint64)
+    if len(words) < 4:
+        return None
+
+    M = 1 << 64
+    d01 = int(words[1]) - int(words[0])
+    d12 = int(words[2]) - int(words[1])
+
+    if d01 == 0 or d01 % 2 == 0:
+        return None
+
+    def modinv(a, m):
+        g, x, _ = _extended_gcd(a % m, m)
+        if g != 1:
+            return None
+        return x % m
+
+    inv = modinv(d01, M)
+    if inv is None:
+        return None
+
+    a = (d12 * inv) % M
+    c = (int(words[1]) - a * int(words[0])) % M
+
+    x = int(words[0])
+    for i in range(1, len(words)):
+        x = (a * x + c) % M
+        if x != int(words[i]):
+            return None
+
+    return {'type': 'lcg64', 'seed': int(words[0]), 'a': a, 'c': c, 'n_words': len(words)}
+
+
+def _try_detect_xorshift32(data: np.ndarray) -> dict:
+    """Try to detect XORShift32: x ^= x << S; x ^= x >> T; x ^= x << U."""
+    n = len(data)
+    if n < 16 or n % 4 != 0:
+        return None
+    words = np.frombuffer(data.tobytes()[:n - (n % 4)], dtype=np.uint32)
+    if len(words) < 4:
+        return None
+
+    M = (1 << 32) - 1
+    # Try common shift triples (1-31)
+    for S in range(1, 32):
+        for T in range(1, 32):
+            for U in range(1, 32):
+                x = int(words[0])
+                ok = True
+                for i in range(1, min(len(words), 20)):  # check first 20
+                    x = x ^ ((x << S) & M)
+                    x = x ^ (x >> T)
+                    x = x ^ ((x << U) & M)
+                    if x != int(words[i]):
+                        ok = False
+                        break
+                if ok:
+                    # Verify full sequence
+                    x = int(words[0])
+                    full_ok = True
+                    for i in range(1, len(words)):
+                        x = x ^ ((x << S) & M)
+                        x = x ^ (x >> T)
+                        x = x ^ ((x << U) & M)
+                        if x != int(words[i]):
+                            full_ok = False
+                            break
+                    if full_ok:
+                        return {'type': 'xorshift32', 'seed': int(words[0]),
+                                'S': S, 'T': T, 'U': U, 'n_words': len(words)}
+    return None
+
+
+def _reconstruct_prng(params: dict) -> bytes:
+    """Reconstruct data from PRNG parameters."""
+    t = params['type']
+    if t == 'lcg32':
+        M = 1 << 32
+        a, c = params['a'], params['c']
+        x = params['seed']
+        out = np.zeros(params['n_words'], dtype=np.uint32)
+        out[0] = x
+        for i in range(1, params['n_words']):
+            x = (a * x + c) % M
+            out[i] = x
+        return out.tobytes()
+    elif t == 'lcg64':
+        M = 1 << 64
+        a, c = params['a'], params['c']
+        x = params['seed']
+        out = np.zeros(params['n_words'], dtype=np.uint64)
+        out[0] = x
+        for i in range(1, params['n_words']):
+            x = (a * x + c) % M
+            out[i] = x
+        return out.tobytes()
+    elif t == 'xorshift32':
+        M = (1 << 32) - 1
+        S, T, U = params['S'], params['T'], params['U']
+        x = params['seed']
+        out = np.zeros(params['n_words'], dtype=np.uint32)
+        out[0] = x
+        for i in range(1, params['n_words']):
+            x = x ^ ((x << S) & M)
+            x = x ^ (x >> T)
+            x = x ^ ((x << U) & M)
+            out[i] = x
+        return out.tobytes()
+    return b''
+
+
+def compress_binary_prng(input_path: str, output_path: str, emitter: ProgressEmitter):
+    """Try to detect PRNG. If found, store just the parameters."""
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    emitter.emit("scan", progress=0.3, current_ratio=1.0)
+
+    # Try each detector
+    params = None
+    for detector in [_try_detect_lcg32, _try_detect_lcg64, _try_detect_xorshift32]:
+        emitter.emit("scan", progress=0.5, current_ratio=1.0)
+        params = detector(data)
+        if params is not None:
+            break
+
+    emitter.emit("scan", progress=1.0, current_ratio=1.0)
+
+    if params is None:
+        # Not a PRNG — fall back
+        return None
+
+    # Verify reconstruction
+    reconstructed = _reconstruct_prng(params)
+    # Pad/truncate to original length
+    if len(reconstructed) >= n:
+        reconstructed = reconstructed[:n]
+    else:
+        # PRNG output is shorter than data — store remainder separately
+        remainder = data.tobytes()[len(reconstructed):]
+    if reconstructed != data.tobytes()[:len(reconstructed)]:
+        return None
+
+    # Check if there's remainder
+    remainder = data.tobytes()[len(reconstructed):]
+    remainder_len = len(remainder)
+
+    emitter.emit("encode", progress=0.5, current_ratio=999.0, throughput_mbs=0.0)
+
+    # Write: MAGIC_PRG + ver + orig + crc + type + params + remainder_len + remainder
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_PRG)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+        f.write(struct.pack('>I', crc))
+
+        # Type string (8 bytes)
+        t = params['type']
+        f.write(t.encode('ascii').ljust(16, b'\x00')[:16])
+
+        if t == 'lcg32':
+            f.write(struct.pack('>Q', params['seed']))      # store as 64-bit
+            f.write(struct.pack('>Q', params['a']))
+            f.write(struct.pack('>Q', params['c']))
+            f.write(struct.pack('>Q', params['n_words']))
+        elif t == 'lcg64':
+            f.write(struct.pack('>Q', params['seed'] & 0xFFFFFFFFFFFFFFFF))
+            f.write(struct.pack('>Q', params['a'] & 0xFFFFFFFFFFFFFFFF))
+            f.write(struct.pack('>Q', params['c'] & 0xFFFFFFFFFFFFFFFF))
+            f.write(struct.pack('>Q', params['n_words']))
+        elif t == 'xorshift32':
+            f.write(struct.pack('>Q', params['seed']))
+            f.write(struct.pack('>B', params['S']))
+            f.write(struct.pack('>B', params['T']))
+            f.write(struct.pack('>B', params['U']))
+            f.write(struct.pack('>Q', params['n_words']))
+
+        # Remainder
+        f.write(struct.pack('>Q', remainder_len))
+        if remainder_len > 0:
+            f.write(remainder)
+
+    out_size = os.path.getsize(output_path)
+    ratio = orig / max(out_size, 1)
+    emitter.emit("encode", progress=1.0, current_ratio=round(ratio, 3),
+                 throughput_mbs=0.0)
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_prng(input_path: str, output_path: str, emitter: ProgressEmitter):
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_PRG:
+            raise ValueError(f"Bad magic for PRG mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        t = f.read(16).rstrip(b'\x00').decode('ascii')
+
+        if t == 'lcg32':
+            seed = struct.unpack('>Q', f.read(8))[0]
+            a = struct.unpack('>Q', f.read(8))[0]
+            c = struct.unpack('>Q', f.read(8))[0]
+            n_words = struct.unpack('>Q', f.read(8))[0]
+            params = {'type': 'lcg32', 'seed': seed, 'a': a, 'c': c, 'n_words': n_words}
+        elif t == 'lcg64':
+            seed = struct.unpack('>Q', f.read(8))[0]
+            a = struct.unpack('>Q', f.read(8))[0]
+            c = struct.unpack('>Q', f.read(8))[0]
+            n_words = struct.unpack('>Q', f.read(8))[0]
+            params = {'type': 'lcg64', 'seed': seed, 'a': a, 'c': c, 'n_words': n_words}
+        elif t == 'xorshift32':
+            seed = struct.unpack('>Q', f.read(8))[0]
+            S = struct.unpack('>B', f.read(1))[0]
+            T = struct.unpack('>B', f.read(1))[0]
+            U = struct.unpack('>B', f.read(1))[0]
+            n_words = struct.unpack('>Q', f.read(8))[0]
+            params = {'type': 'xorshift32', 'seed': seed, 'S': S, 'T': T, 'U': U, 'n_words': n_words}
+        else:
+            raise ValueError(f"Unknown PRNG type: {t}")
+
+        remainder_len = struct.unpack('>Q', f.read(8))[0]
+        remainder = f.read() if remainder_len > 0 else b''
+
+    emitter.emit("decode", progress=0.0)
+    reconstructed = _reconstruct_prng(params)
+    # Truncate to original (in case PRNG produced more)
+    out_data = (reconstructed + remainder)[:orig]
+    emitter.emit("decode", progress=1.0)
+
+    actual_crc = zlib.crc32(out_data) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out_data)
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
+
+
+# =========================================================================
+# BIT-PLANE DECOMPOSITION — split into 8 bit-planes, compress each
+# =========================================================================
+
+def compress_binary_bpl(input_path: str, output_path: str, emitter: ProgressEmitter):
+    """Bit-plane decomposition: split data into 8 bit-planes, compress each with O2."""
+    _, _, _, _, _encode_o2, _ = _kernels()
+    _, _finish, _, _, _, _ = _kernels()
+
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    emitter.emit("scan", progress=0.3, current_ratio=1.0)
+
+    # Decompose into 8 bit-planes (MSB first)
+    planes = []
+    for bit in range(7, -1, -1):
+        plane = ((data >> bit) & 1).astype(np.uint8)
+        # Pack bits into bytes for O2 (8 bits per byte)
+        # Actually, let's keep them as bytes (0 or 1) — O2 will handle it
+        planes.append(plane)
+    emitter.emit("scan", progress=0.5, current_ratio=1.0)
+
+    # Compress each plane with O2
+    out_buf = bytearray()
+    plane_sizes = []
+    for i, plane in enumerate(planes):
+        emitter.emit("encode", progress=i / 8, current_ratio=1.0, throughput_mbs=0.0)
+        cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+        cum_freqs[:] = np.arange(257, dtype=np.uint32)
+        state = np.array([0, TOP_VALUE, 0, 0, 0], dtype=np.int64)
+        safe_buf = max(n + 1024, 4096)
+        enc_buf = np.zeros(safe_buf, dtype=np.uint8)
+        n_w = _encode_o2(plane, cum_freqs, state, enc_buf, safe_buf)
+        fin_buf = np.zeros(64, dtype=np.uint8)
+        n_fin = _finish(state, fin_buf, 64)
+        plane_data = enc_buf[:n_w].tobytes() + fin_buf[:n_fin].tobytes()
+        plane_sizes.append(len(plane_data))
+        out_buf.extend(plane_data)
+
+    emitter.emit("encode", progress=1.0, current_ratio=1.0, throughput_mbs=0.0)
+
+    crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_BPL)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        f.write(struct.pack('>I', crc))
+        # 8 plane sizes
+        for s in plane_sizes:
+            f.write(struct.pack('>Q', s))
+        f.write(bytes(out_buf))
+
+    out_size = os.path.getsize(output_path)
+    if out_size >= orig:
+        os.remove(output_path)
+        with open(output_path, 'wb') as f:
+            f.write(MAGIC_BPL)
+            f.write(struct.pack('>B', 6))
+            f.write(struct.pack('>Q', orig))
+            f.write(struct.pack('>I', crc))
+            for _ in range(8):
+                f.write(struct.pack('>Q', 0))  # store marker
+            f.write(data.tobytes())
+        out_size = os.path.getsize(output_path)
+        ratio = orig / out_size
+    else:
+        ratio = orig / out_size
+
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_bpl(input_path: str, output_path: str, emitter: ProgressEmitter):
+    _, _, _, _, _, _decode_o2 = _kernels()
+
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_BPL:
+            raise ValueError(f"Bad magic for BPL mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        plane_sizes = [struct.unpack('>Q', f.read(8))[0] for _ in range(8)]
+
+        # Store mode check
+        if all(s == 0 for s in plane_sizes):
+            raw = f.read()
+            actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
+            if actual_crc != crc:
+                raise ValueError(f"CRC mismatch (store): {crc:08x} vs {actual_crc:08x}")
+            with open(output_path, 'wb') as fout:
+                fout.write(raw)
+            emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                         time_s=round(time.time() - emitter.t0, 2))
+            return
+
+        # Read all plane data
+        all_data = f.read()
+
+    # Decompress each plane
+    offset = 0
+    planes = []
+    for i, psize in enumerate(plane_sizes):
+        emitter.emit("decode", progress=i / 8)
+        plane_bytes = all_data[offset:offset + psize]
+        offset += psize
+
+        # O2 decode
+        compressed = np.frombuffer(plane_bytes, dtype=np.uint8)
+        cum_freqs = np.zeros((65536, 257), dtype=np.uint32)
+        cum_freqs[:] = np.arange(257, dtype=np.uint32)
+
+        value = np.int64(0)
+        buf_ptr = 0
+        bit_ptr = 7
+        for _ in range(32):
+            if buf_ptr < len(compressed):
+                byte = int(compressed[buf_ptr])
+                bit = (byte >> bit_ptr) & 1
+                bit_ptr -= 1
+                if bit_ptr < 0:
+                    bit_ptr = 7; buf_ptr += 1
+            else:
+                bit = 0
+            value = (value << np.int64(1)) | np.int64(bit)
+        state = np.array([0, TOP_VALUE, value, buf_ptr, bit_ptr], dtype=np.int64)
+
+        plane = np.zeros(orig, dtype=np.uint8)
+        if orig > 0:
+            _decode_o2(compressed, orig, cum_freqs, state, plane)
+        planes.append(plane)
+
+    emitter.emit("decode", progress=1.0)
+
+    # Reconstruct: each plane contributes one bit
+    out = np.zeros(orig, dtype=np.uint8)
+    for bit_idx, plane in enumerate(planes):
+        shift = 7 - bit_idx
+        out |= (plane & 1) << shift
+
+    actual_crc = zlib.crc32(out.tobytes()) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out.tobytes())
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
+
 
 def compress_binary_delta(input_path: str, output_path: str, emitter: ProgressEmitter,
                           delta_order: int = 1, use_xor: bool = False):
@@ -3747,7 +4231,19 @@ def compress(input_path: str, output_path: str, emitter: Optional[ProgressEmitte
         size = os.path.getsize(input_path)
         candidates = []
 
-        # Try O2+RLE
+        # Try PRNG detection FIRST (can give 10000x+ on pseudo-random data)
+        tmp_prg = output_path + '.prg.tmp'
+        try:
+            r = compress_binary_prng(input_path, tmp_prg, emitter)
+            if r is not None:
+                candidates.append(('prg', tmp_prg, os.path.getsize(tmp_prg)))
+            else:
+                if os.path.exists(tmp_prg): os.remove(tmp_prg)
+        except Exception as e:
+            ProgressEmitter.log(f"PRG candidate failed: {e}")
+            if os.path.exists(tmp_prg): os.remove(tmp_prg)
+
+        # Try O2+RLE (always)
         tmp_o2 = output_path + '.o2.tmp'
         try:
             compress_binary_o2(input_path, tmp_o2, emitter)
@@ -3799,6 +4295,15 @@ def compress(input_path: str, output_path: str, emitter: Optional[ProgressEmitte
                 candidates.append(('bit', tmp_bit, os.path.getsize(tmp_bit)))
             except Exception as e:
                 ProgressEmitter.log(f"BIT candidate failed: {e}")
+
+        # Try Bit-plane decomposition (for files <= 1MB)
+        if size <= 1_000_000:
+            tmp_bpl = output_path + '.bpl.tmp'
+            try:
+                compress_binary_bpl(input_path, tmp_bpl, emitter)
+                candidates.append(('bpl', tmp_bpl, os.path.getsize(tmp_bpl)))
+            except Exception as e:
+                ProgressEmitter.log(f"BPL candidate failed: {e}")
 
         # Try Delta encoding (for files <= 5MB — best for counters/timestamps)
         if size <= 5_000_000:
@@ -3861,6 +4366,10 @@ def decompress(input_path: str, output_path: str, emitter: Optional[ProgressEmit
         return decompress_binary_bit(input_path, output_path, emitter)
     elif magic == MAGIC_DLT:
         return decompress_binary_delta(input_path, output_path, emitter)
+    elif magic == MAGIC_PRG:
+        return decompress_binary_prng(input_path, output_path, emitter)
+    elif magic == MAGIC_BPL:
+        return decompress_binary_bpl(input_path, output_path, emitter)
     elif magic == MAGIC_V5:
         raise NotImplementedError("Legacy v5 (.nfr) decode not supported by v6 engine. Use NFR_Release/nfr.py.")
     else:
