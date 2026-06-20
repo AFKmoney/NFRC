@@ -2141,7 +2141,481 @@ def decompress_binary_bit(input_path: str, output_path: str, emitter: ProgressEm
 
 MAGIC_DLT = b'NFD\x00'  # NFR Delta/XOR + O2
 MAGIC_PRG = b'NFR\x00'  # NFR PRNG-detected (seed + params)
+MAGIC_KOL = b'NFK\x00'  # NFR Kolmogorov (polynomial/math structure)
 MAGIC_BPL = b'NFL\x00' # NFR Bit-plane decomposition (was NFPL, fixed to 4 bytes)
+
+
+# =========================================================================
+# KOLMOGOROV COMPLEXITY COMPRESSOR
+# =========================================================================
+# Shannon's entropy gives a lower bound based on the SOURCE distribution.
+# Kolmogorov complexity K(x) gives the length of the shortest PROGRAM that
+# produces x. For strings with hidden mathematical structure (π digits,
+# squares, Fibonacci, polynomials), K(x) << |x| even though Shannon ≈ |x|.
+#
+# We try to detect: constant sequences, arithmetic (linear), quadratic,
+# cubic, quartic polynomials, geometric, and Fibonacci — interpreting the
+# byte stream as integers in various bases (256, 16, 10, 9, 8, 2).
+
+def _interpret_as_ints(data: np.ndarray, base: int) -> np.ndarray:
+    """Interpret byte stream as a sequence of integers in the given base.
+    For base 256: each byte is one integer.
+    For base 16/10/9/8/2: split byte stream into base-'base' digits, then
+    chunk into fixed-width integers (so a polynomial can fit).
+    We use width = log_b(2^32) so each chunk fits in a uint32."""
+    if base == 256:
+        return data.astype(np.int64)
+    # For other bases, treat each byte as a digit in base 'base' (if < base)
+    # Actually, simpler: each byte IS the digit value, but we filter to < base
+    # Then chunk every K digits into one integer where K = bits needed
+    import math
+    if base <= 1:
+        return None
+    # Filter: only keep bytes < base (if any byte >= base, this base doesn't fit)
+    if data.max() >= base:
+        return None
+    # Chunk size: enough digits to fill ~32 bits
+    chunk = max(1, int(math.floor(math.log(2**32, base))))
+    n = len(data)
+    n_chunks = n // chunk
+    if n_chunks < 4:
+        return None
+    out = np.zeros(n_chunks, dtype=np.int64)
+    for i in range(n_chunks):
+        val = 0
+        for k in range(chunk):
+            val = val * base + int(data[i * chunk + k])
+        out[i] = val
+    return out
+
+
+def _fit_polynomial(seq: np.ndarray, degree: int, mod: int = None) -> list:
+    """Fit polynomial of given degree to sequence. Returns coeffs [a0, a1, ...]
+    such that seq[i] = (a0 + a1*i + a2*i^2 + ... + ad*i^d) mod `mod`.
+    If mod is None, requires exact integer fit (no mod).
+    Returns None if no fit found."""
+    n = len(seq)
+    if n < degree + 2:
+        return None
+    m = degree + 1
+
+    if mod is None:
+        # Exact integer fit via Vandermonde
+        V = np.zeros((m, m), dtype=np.float64)
+        for i in range(m):
+            for j in range(m):
+                V[i, j] = i ** j
+        b = seq[:m].astype(np.float64)
+        try:
+            coeffs = np.linalg.solve(V, b)
+        except np.linalg.LinAlgError:
+            return None
+        coeffs_int = np.round(coeffs).astype(np.int64)
+        for i in range(m):
+            val = sum(int(coeffs_int[j]) * (i ** j) for j in range(m))
+            if val != int(seq[i]):
+                return None
+        for i in range(n):
+            val = sum(int(coeffs_int[j]) * (i ** j) for j in range(m))
+            if val != int(seq[i]):
+                return None
+        return coeffs_int.tolist()
+    else:
+        # Modular fit using finite differences (no division needed!)
+        # If seq is a polynomial of degree d mod m, the d-th finite difference
+        # is constant mod m. We store: first (d+1) values + constant d-th diff.
+        # Reconstruction: integrate the difference table iteratively.
+
+        if degree == 0:
+            c0 = int(seq[0]) % mod
+            for i in range(n):
+                if c0 != int(seq[i]) % mod:
+                    return None
+            return {'newton': [c0], 'mod': mod}
+
+        # Compute d-th finite differences on first (degree+3) points
+        diffs = seq[:degree + 3].astype(np.int64).copy()
+        for d in range(degree):
+            diffs = np.diff(diffs)
+        # diffs should all be equal mod `mod`
+        if len(diffs) < 2:
+            return None
+        lead = int(diffs[0]) % mod
+        for v in diffs:
+            if int(v) % mod != lead:
+                return None
+
+        # Store: first (degree+1) values + the constant d-th difference
+        first_vals = [int(seq[k]) % mod for k in range(degree + 1)]
+        const_d_diff = lead
+
+        # VERIFY on ALL points by reconstructing iteratively
+        # Build the difference table from first_vals, then extend
+        table = [first_vals[:] ]  # table[0] = original values
+        for d in range(1, degree + 1):
+            row = []
+            for k in range(len(table[-1]) - 1):
+                row.append((int(table[-1][k+1]) - int(table[-1][k])) % mod)
+            table.append(row)
+        # table[degree] should have 1 element = const_d_diff
+        # Now extend: for each new point, work backwards up the table
+        reconstructed = list(first_vals)
+        for i in range(degree + 1, n):
+            # Extend each row from bottom up
+            table[degree].append(const_d_diff)
+            for d in range(degree - 1, -1, -1):
+                new_val = (int(table[d][-1]) + int(table[d+1][-1])) % mod
+                table[d].append(new_val)
+            reconstructed.append(table[0][-1])
+
+        # Verify
+        for i in range(n):
+            if reconstructed[i] != int(seq[i]) % mod:
+                return None
+
+        return {'newton': first_vals + [const_d_diff], 'mod': mod}
+
+
+def _try_detect_polynomial(data: np.ndarray, base: int, max_degree: int = 4) -> dict:
+    """Try to fit a polynomial of degree 0..max_degree to the data interpreted
+    as integers in the given base. Tries both exact and modular fits."""
+    seq = _interpret_as_ints(data, base)
+    if seq is None or len(seq) < 6:
+        return None
+
+    # Try exact fit first (no mod)
+    for degree in range(0, max_degree + 1):
+        coeffs = _fit_polynomial(seq, degree, mod=None)
+        if coeffs is not None:
+            return {
+                'type': 'poly',
+                'base': base,
+                'degree': degree,
+                'coeffs': coeffs,
+                'n_ints': len(seq),
+                'orig_len': len(data),
+                'mod': 0,  # 0 means no mod
+            }
+
+    # Try modular fits (for base 256, mod 256 is natural)
+    if base == 256:
+        for mod in [256, 65536]:
+            for degree in range(0, max_degree + 1):
+                coeffs = _fit_polynomial(seq, degree, mod=mod)
+                if coeffs is not None:
+                    if isinstance(coeffs, dict) and 'newton' in coeffs:
+                        return {
+                            'type': 'poly_newton',
+                            'base': base,
+                            'degree': degree,
+                            'fwd_diffs': coeffs['newton'],
+                            'mod': coeffs['mod'],
+                            'n_ints': len(seq),
+                            'orig_len': len(data),
+                        }
+                    else:
+                        return {
+                            'type': 'poly',
+                            'base': base,
+                            'degree': degree,
+                            'coeffs': coeffs,
+                            'n_ints': len(seq),
+                            'orig_len': len(data),
+                            'mod': mod,
+                        }
+    return None
+
+
+def _try_detect_geometric(data: np.ndarray, base: int) -> dict:
+    """Detect geometric sequence: a[i] = a0 * r^i."""
+    seq = _interpret_as_ints(data, base)
+    if seq is None or len(seq) < 4:
+        return None
+    if int(seq[0]) == 0:
+        return None
+    # r = seq[1] / seq[0]  (must be integer)
+    if int(seq[1]) % int(seq[0]) != 0:
+        return None
+    r = int(seq[1]) // int(seq[0])
+    if r == 0:
+        return None
+    # Verify
+    a0 = int(seq[0])
+    for i in range(len(seq)):
+        expected = a0 * (r ** i)
+        if expected != int(seq[i]):
+            return None
+    return {
+        'type': 'geom',
+        'base': base,
+        'a0': a0,
+        'r': r,
+        'n_ints': len(seq),
+        'orig_len': len(data),
+    }
+
+
+def _try_detect_fibonacci(data: np.ndarray, base: int) -> dict:
+    """Detect Fibonacci-like: a[i] = a[i-1] + a[i-2]."""
+    seq = _interpret_as_ints(data, base)
+    if seq is None or len(seq) < 5:
+        return None
+    a0, a1 = int(seq[0]), int(seq[1])
+    for i in range(2, len(seq)):
+        expected = int(seq[i-1]) + int(seq[i-2])
+        if expected != int(seq[i]):
+            return None
+    return {
+        'type': 'fib',
+        'base': base,
+        'a0': a0,
+        'a1': a1,
+        'n_ints': len(seq),
+        'orig_len': len(data),
+    }
+
+
+def _reconstruct_kolmogorov(params: dict) -> bytes:
+    """Reconstruct data from Kolmogorov parameters."""
+    t = params['type']
+    base = params['base']
+    n_ints = params['n_ints']
+    orig_len = params['orig_len']
+
+    if t == 'poly':
+        degree = params['degree']
+        coeffs = params['coeffs']
+        mod = params.get('mod', 0)
+        seq = np.zeros(n_ints, dtype=np.int64)
+        for i in range(n_ints):
+            val = 0
+            for j in range(degree + 1):
+                val += int(coeffs[j]) * (i ** j)
+            if mod > 0:
+                val = val % mod
+            seq[i] = val
+    elif t == 'poly_newton':
+        degree = params['degree']
+        # fwd_diffs = first (degree+1) values + constant d-th difference
+        all_vals = params['fwd_diffs']
+        mod = params['mod']
+        first_vals = all_vals[:degree + 1]
+        const_d_diff = all_vals[degree + 1] if len(all_vals) > degree + 1 else 0
+
+        # Reconstruct using difference table
+        table = [list(first_vals)]
+        for d in range(1, degree + 1):
+            row = []
+            for k in range(len(table[-1]) - 1):
+                row.append((int(table[-1][k+1]) - int(table[-1][k])) % mod)
+            table.append(row)
+
+        seq = list(first_vals)
+        for i in range(degree + 1, n_ints):
+            table[degree].append(const_d_diff)
+            for d in range(degree - 1, -1, -1):
+                new_val = (int(table[d][-1]) + int(table[d+1][-1])) % mod
+                table[d].append(new_val)
+            seq.append(table[0][-1])
+        seq = np.array(seq, dtype=np.int64)
+    elif t == 'geom':
+        a0, r = params['a0'], params['r']
+        seq = np.array([a0 * (r ** i) for i in range(n_ints)], dtype=np.int64)
+    elif t == 'fib':
+        a0, a1 = params['a0'], params['a1']
+        seq = np.zeros(n_ints, dtype=np.int64)
+        seq[0] = a0
+        if n_ints > 1:
+            seq[1] = a1
+        for i in range(2, n_ints):
+            seq[i] = seq[i-1] + seq[i-2]
+    else:
+        return b''
+
+    # Convert integers back to bytes
+    if base == 256:
+        out = seq.astype(np.uint8).tobytes()
+    else:
+        # Each integer was chunk * base-digits wide
+        import math
+        chunk = max(1, int(math.floor(math.log(2**32, base))))
+        out = bytearray()
+        for v in seq:
+            digits = []
+            v = int(v)
+            for _ in range(chunk):
+                digits.append(v % base)
+                v //= base
+            digits.reverse()
+            out.extend(digits)
+        out = bytes(out)
+
+    # Trim/pad to original length
+    if len(out) >= orig_len:
+        return out[:orig_len]
+    else:
+        return out  # remainder handled separately
+
+
+def compress_binary_kol(input_path: str, output_path: str, emitter: ProgressEmitter):
+    """Kolmogorov compressor: detect polynomial/geometric/Fibonacci structure."""
+    orig = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig, output_size=0, ratio=1.0)
+    emitter.emit("scan", progress=0.0, current_ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    n = len(data)
+    if n < 8:
+        return None
+
+    emitter.emit("scan", progress=0.2, current_ratio=1.0)
+
+    # Try each base × each detector
+    params = None
+    bases = [256, 16, 10, 9, 8, 2]
+    for base in bases:
+        emitter.emit("scan", progress=0.5, current_ratio=1.0)
+        # Try polynomial (degrees 0-4)
+        params = _try_detect_polynomial(data, base, max_degree=4)
+        if params:
+            break
+        # Try geometric
+        params = _try_detect_geometric(data, base)
+        if params:
+            break
+        # Try Fibonacci
+        params = _try_detect_fibonacci(data, base)
+        if params:
+            break
+
+    emitter.emit("scan", progress=1.0, current_ratio=1.0)
+
+    if params is None:
+        return None
+
+    # Verify reconstruction
+    reconstructed = _reconstruct_kolmogorov(params)
+    if len(reconstructed) < n:
+        # Need to store remainder
+        remainder = data.tobytes()[len(reconstructed):]
+    elif len(reconstructed) > n:
+        reconstructed = reconstructed[:n]
+        remainder = b''
+    else:
+        remainder = b''
+
+    if reconstructed != data.tobytes()[:len(reconstructed)]:
+        return None
+
+    remainder_len = len(remainder)
+    emitter.emit("encode", progress=0.5, current_ratio=999.0, throughput_mbs=0.0)
+
+    # Write: MAGIC_KOL + ver + orig + crc + type + base + params + remainder
+    with open(output_path, 'wb') as f:
+        f.write(MAGIC_KOL)
+        f.write(struct.pack('>B', 6))
+        f.write(struct.pack('>Q', orig))
+        crc = zlib.crc32(data.tobytes()) & 0xFFFFFFFF
+        f.write(struct.pack('>I', crc))
+
+        t = params['type']
+        f.write(t.encode('ascii').ljust(16, b'\x00')[:16])
+        f.write(struct.pack('>I', params['base']))
+        f.write(struct.pack('>Q', params['n_ints']))
+
+        if t == 'poly':
+            f.write(struct.pack('>I', params['degree']))
+            f.write(struct.pack('>I', len(params['coeffs'])))
+            f.write(struct.pack('>Q', params.get('mod', 0)))
+            for c in params['coeffs']:
+                f.write(struct.pack('>q', int(c)))
+        elif t == 'poly_newton':
+            f.write(struct.pack('>I', params['degree']))
+            f.write(struct.pack('>I', len(params['fwd_diffs'])))
+            f.write(struct.pack('>Q', params['mod']))
+            for c in params['fwd_diffs']:
+                f.write(struct.pack('>q', int(c)))
+        elif t == 'geom':
+            f.write(struct.pack('>q', params['a0']))
+            f.write(struct.pack('>q', params['r']))
+        elif t == 'fib':
+            f.write(struct.pack('>q', params['a0']))
+            f.write(struct.pack('>q', params['a1']))
+
+        f.write(struct.pack('>Q', remainder_len))
+        if remainder_len > 0:
+            f.write(remainder)
+
+    out_size = os.path.getsize(output_path)
+    ratio = orig / max(out_size, 1)
+    emitter.emit("encode", progress=1.0, current_ratio=round(ratio, 3),
+                 throughput_mbs=0.0)
+    emitter.emit("done", input_size=orig, output_size=out_size,
+                 ratio=round(ratio, 3),
+                 time_s=round(time.time() - emitter.t0, 2))
+    return ratio
+
+
+def decompress_binary_kol(input_path: str, output_path: str, emitter: ProgressEmitter):
+    orig_size = os.path.getsize(input_path)
+    emitter.emit("start", mode="binary", input_size=orig_size, output_size=0, ratio=1.0)
+
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != MAGIC_KOL:
+            raise ValueError(f"Bad magic for KOL mode: {magic!r}")
+        ver = struct.unpack('>B', f.read(1))[0]
+        orig = struct.unpack('>Q', f.read(8))[0]
+        crc = struct.unpack('>I', f.read(4))[0]
+        t = f.read(16).rstrip(b'\x00').decode('ascii')
+        base = struct.unpack('>I', f.read(4))[0]
+        n_ints = struct.unpack('>Q', f.read(8))[0]
+
+        params = {'type': t, 'base': base, 'n_ints': n_ints, 'orig_len': orig}
+
+        if t == 'poly':
+            degree = struct.unpack('>I', f.read(4))[0]
+            n_coeffs = struct.unpack('>I', f.read(4))[0]
+            mod = struct.unpack('>Q', f.read(8))[0]
+            coeffs = [struct.unpack('>q', f.read(8))[0] for _ in range(n_coeffs)]
+            params['degree'] = degree
+            params['coeffs'] = coeffs
+            params['mod'] = mod
+        elif t == 'poly_newton':
+            degree = struct.unpack('>I', f.read(4))[0]
+            n_diffs = struct.unpack('>I', f.read(4))[0]
+            mod = struct.unpack('>Q', f.read(8))[0]
+            fwd_diffs = [struct.unpack('>q', f.read(8))[0] for _ in range(n_diffs)]
+            params['degree'] = degree
+            params['fwd_diffs'] = fwd_diffs
+            params['mod'] = mod
+        elif t == 'geom':
+            params['a0'] = struct.unpack('>q', f.read(8))[0]
+            params['r'] = struct.unpack('>q', f.read(8))[0]
+        elif t == 'fib':
+            params['a0'] = struct.unpack('>q', f.read(8))[0]
+            params['a1'] = struct.unpack('>q', f.read(8))[0]
+        else:
+            raise ValueError(f"Unknown Kolmogorov type: {t}")
+
+        remainder_len = struct.unpack('>Q', f.read(8))[0]
+        remainder = f.read() if remainder_len > 0 else b''
+
+    emitter.emit("decode", progress=0.0)
+    reconstructed = _reconstruct_kolmogorov(params)
+    out_data = (reconstructed + remainder)[:orig]
+    emitter.emit("decode", progress=1.0)
+
+    actual_crc = zlib.crc32(out_data) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(f"CRC mismatch: {crc:08x} vs {actual_crc:08x}")
+
+    with open(output_path, 'wb') as f:
+        f.write(out_data)
+
+    emitter.emit("done", input_size=orig, output_size=orig, ratio=1.0,
+                 time_s=round(time.time() - emitter.t0, 2))
 
 
 # =========================================================================
@@ -4243,6 +4717,18 @@ def compress(input_path: str, output_path: str, emitter: Optional[ProgressEmitte
             ProgressEmitter.log(f"PRG candidate failed: {e}")
             if os.path.exists(tmp_prg): os.remove(tmp_prg)
 
+        # Try Kolmogorov detector (polynomial/geometric/Fibonacci in various bases)
+        tmp_kol = output_path + '.kol.tmp'
+        try:
+            r = compress_binary_kol(input_path, tmp_kol, emitter)
+            if r is not None:
+                candidates.append(('kol', tmp_kol, os.path.getsize(tmp_kol)))
+            else:
+                if os.path.exists(tmp_kol): os.remove(tmp_kol)
+        except Exception as e:
+            ProgressEmitter.log(f"KOL candidate failed: {e}")
+            if os.path.exists(tmp_kol): os.remove(tmp_kol)
+
         # Try O2+RLE (always)
         tmp_o2 = output_path + '.o2.tmp'
         try:
@@ -4368,6 +4854,8 @@ def decompress(input_path: str, output_path: str, emitter: Optional[ProgressEmit
         return decompress_binary_delta(input_path, output_path, emitter)
     elif magic == MAGIC_PRG:
         return decompress_binary_prng(input_path, output_path, emitter)
+    elif magic == MAGIC_KOL:
+        return decompress_binary_kol(input_path, output_path, emitter)
     elif magic == MAGIC_BPL:
         return decompress_binary_bpl(input_path, output_path, emitter)
     elif magic == MAGIC_V5:
